@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Physical Education Academy</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        .emoji-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(40px, 1fr)); gap: 0.5rem; }
+        .emoji-item { cursor: pointer; transition: transform 0.2s; }
+        .emoji-item:hover { transform: scale(1.2); }
+        .emoji-item.selected { border: 2px solid #4f46e5; border-radius: 50%; padding: 2px; box-shadow: 0 0 5px rgba(79, 70, 229, 0.5); }
+        .prose-styles { max-width: 100%; }
+        .prose-styles p { margin-bottom: 1em; }
+        .prose-styles ul { list-style-position: inside; margin-left: 1.5em; margin-bottom: 1em; }
+        .prose-styles li { margin-bottom: 0.5em; }
+        .solution-container { display: none; }
+    </style>
+</head>
+<body class="bg-gray-50">
+
+    <div id="app-container"></div>
+    <div id="modal-container" class="fixed inset-0 z-50 items-center justify-center hidden"></div>
+
+    <script type="module">
+        // Firebase Imports
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, onAuthStateChanged, signOut, GoogleAuthProvider, signInWithPopup } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, doc, getDocs, getDoc, setDoc, updateDoc, query, orderBy, arrayUnion, addDoc, limit, where } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- FIREBASE CONFIG ---
+        const firebaseConfig = {
+          apiKey: "AIzaSyDb-J-XzriOr51DzDX6tM2HiRAQV_LKhto",
+          authDomain: "physical-education-academy.firebaseapp.com",
+          projectId: "physical-education-academy",
+          storageBucket: "physical-education-academy.appspot.com",
+          messagingSenderId: "42844156937",
+          appId: "1:42844156937:web:3e7d8f77ed53d2fdc1f4d8",
+          measurementId: "G-RH6LRMTNNZ"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const googleProvider = new GoogleAuthProvider();
+
+        // --- GLOBAL STATE ---
+        let currentUser = null;
+        let testSeriesData = [];
+        let currentTests = [];
+        let currentView = { name: 'website', props: {} };
+        let timerInterval = null;
+        window.preferredLanguage = 'en';
+        
+        const appContainer = document.getElementById('app-container');
+        const modalContainer = document.getElementById('modal-container');
+        
+        // --- GEMINI API FUNCTION ---
+        async function callGeminiAPI(prompt) {
+            const apiKey = ""; // API key is handled by the environment
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+            const payload = { contents: [{ parts: [{ text: prompt }] }] };
+            try {
+                const response = await fetch(apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                if (!response.ok) throw new Error(`API call failed with status: ${response.status}`);
+                const result = await response.json();
+                const candidate = result.candidates?.[0];
+                return candidate?.content?.parts?.[0]?.text || "Sorry, I couldn't generate a response.";
+            } catch (error) {
+                console.error("Gemini API call error:", error);
+                return "An error occurred while fetching the AI response.";
+            }
+        }
+
+
+        // --- CORE NAVIGATION & RENDERING ---
+        async function navigateTo(view, props = {}) {
+            if (timerInterval) clearInterval(timerInterval);
+            currentView = { name: view, props };
+            appContainer.innerHTML = '<div class="flex justify-center items-center h-screen"><div class="text-indigo-600 font-semibold">Loading...</div></div>';
+            
+            switch(view) {
+                case 'website':
+                    await loadAllTestSeries();
+                    appContainer.innerHTML = renderWebsiteLayout(renderWebsiteHome());
+                    break;
+                case 'testList':
+                    await loadSingleSeries(props.seriesId);
+                    appContainer.innerHTML = renderWebsiteLayout(renderTestListView(props.seriesId));
+                    break;
+                case 'takeTest':
+                    appContainer.innerHTML = renderWebsiteLayout(await renderTestInterface(props.seriesId, props.testId));
+                    break;
+                case 'results':
+                     appContainer.innerHTML = renderWebsiteLayout(await renderResultsPage(props.resultId));
+                     break;
+                case 'reviewTest':
+                     appContainer.innerHTML = renderWebsiteLayout(await renderReviewInterface(props.resultId));
+                     break;
+            }
+        }
+        
+        // --- DATA FETCHING ---
+        async function loadAllTestSeries() {
+            const seriesQuery = query(collection(db, "testSeries"), orderBy("order", "desc"));
+            const querySnapshot = await getDocs(seriesQuery);
+            testSeriesData = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        }
+
+        async function loadSingleSeries(seriesId) {
+            const seriesRef = doc(db, "testSeries", seriesId);
+            const seriesSnap = await getDoc(seriesRef);
+            if (!seriesSnap.exists()) { navigateTo('website'); return; }
+            const series = { id: seriesId, ...seriesSnap.data() };
+            
+            const testsQuery = query(collection(db, "testSeries", seriesId, "tests"), orderBy("order"));
+            const testsSnapshot = await getDocs(testsQuery);
+            currentTests = testsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+            
+            const existingSeriesIndex = testSeriesData.findIndex(s => s.id === seriesId);
+            if (existingSeriesIndex > -1) testSeriesData[existingSeriesIndex] = series;
+            else testSeriesData.push(series);
+        }
+
+        // --- UI HELPER ---
+        function generateInitialsAvatar(name) {
+            if (!name) return '';
+            const colors = ['bg-red-500', 'bg-yellow-500', 'bg-green-500', 'bg-blue-500', 'bg-indigo-500', 'bg-purple-500', 'bg-pink-500'];
+            const initials = name.split(' ').map(n => n[0]).join('').substring(0, 2).toUpperCase();
+            const color = colors[Math.abs(name.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0)) % colors.length];
+            return `<div class="w-full h-48 flex items-center justify-center ${color}"><span class="text-5xl font-bold text-white">${initials}</span></div>`;
+        }
+
+        // --- WEBSITE UI COMPONENTS ---
+        function renderWebsiteLayout(content) {
+             const myCoursesButton = currentUser ? `<button id="my-courses-btn" class="px-3 py-2 text-sm font-medium text-gray-700 hover:text-indigo-600">My Courses</button>` : '';
+             const userNav = currentUser ? `
+                <div class="flex items-center">
+                    <span class="text-3xl">${currentUser.avatar || '👤'}</span>
+                    <div class="ml-3 hidden sm:block"><div class="font-bold text-gray-800">${currentUser.name || ''}</div><div class="text-sm text-gray-500">${currentUser.nickname || ''}</div></div>
+                </div>
+                <button id="logout-btn" class="ml-4 px-3 py-2 text-sm font-medium text-white bg-indigo-600 rounded-md hover:bg-indigo-700">Logout</button>
+             ` : `<button id="login-modal-btn" class="px-3 py-2 text-sm font-medium text-white bg-indigo-600 rounded-md hover:bg-indigo-700">Login / Sign Up</button>`;
+             return `<header class="bg-white shadow-sm sticky top-0 z-40"><nav class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8"><div class="flex justify-between items-center h-16"><a href="#" class="text-xl sm:text-2xl font-bold text-indigo-600 website-home-link">Physical Education Academy</a><div class="flex items-center">${myCoursesButton}${userNav}</div></div></nav></header>${content}`;
+        }
+
+        function renderWebsiteHome() {
+            const seriesCards = testSeriesData.map(series => {
+                const imageHtml = series.imageUrl ? `<img src="${series.imageUrl}" alt="${series.name}" class="w-full h-48 object-cover">` : generateInitialsAvatar(series.name);
+                return `<div class="bg-white rounded-lg shadow-lg overflow-hidden transform hover:-translate-y-1 transition-transform duration-300">
+                    ${imageHtml}
+                    <div class="p-6"><h3 class="text-xl font-bold text-gray-800 mb-2">${series.name}</h3><p class="text-lg font-bold text-indigo-600">₹${series.price || 0}</p><button data-series-id="${series.id}" class="w-full mt-4 px-4 py-2 bg-indigo-600 text-white font-semibold rounded-md hover:bg-indigo-700 view-details-btn">View Details</button></div>
+                </div>`
+            }).join('');
+            return `<main class="max-w-7xl mx-auto py-12 px-4 sm:px-6 lg:px-8"><div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">${seriesCards || '<p class="text-center text-gray-500 col-span-3">No exam series have been added yet.</p>'}</div></main>`;
+        }
+        
+        function renderTestListView(seriesId) {
+            const series = testSeriesData.find(s => s.id === seriesId);
+            const hasPurchased = currentUser?.courses?.includes(seriesId);
+            let purchaseSectionHtml = '';
+            const hasPaidTests = currentTests.some(test => !test.isDemo);
+
+            if (hasPaidTests && !hasPurchased) {
+                purchaseSectionHtml = `<div class="bg-blue-50 border-l-4 border-blue-500 p-6 rounded-r-lg mb-8 text-center shadow-sm"><p class="font-bold text-xl text-blue-800">This is a Premium Course</p><p class="text-blue-700 mt-2">Purchase the course to unlock all paid tests and get full access.</p><button data-series-id="${seriesId}" data-series-name="${series.name}" data-price="${series.price || 0}" class="w-full sm:w-auto mt-4 px-6 py-3 bg-blue-600 text-white font-bold rounded-md hover:bg-blue-700 shadow-lg transform hover:scale-105 transition-transform buy-course-btn">Buy Course Now (₹${series.price || 0})</button></div>`;
+            } else if (hasPurchased) {
+                 purchaseSectionHtml = `<div class="bg-green-50 border-l-4 border-green-500 p-4 rounded-r-lg mb-8 text-center"><p class="font-bold text-green-800">✅ You have access to this course.</p></div>`;
+            }
+
+            const testCards = currentTests.map(test => {
+                let button;
+                if (test.isDemo) {
+                    button = `<button data-series-id="${seriesId}" data-test-id="${test.id}" class="w-full mt-4 px-4 py-2 bg-green-600 text-white font-semibold rounded-md hover:bg-green-700 start-test-btn">Attempt Demo Test</button>`;
+                } else if (hasPurchased) {
+                    button = `<button data-series-id="${seriesId}" data-test-id="${test.id}" class="w-full mt-4 px-4 py-2 bg-green-600 text-white font-semibold rounded-md hover:bg-green-700 start-test-btn">Attempt Paid Test</button>`;
+                } else {
+                    button = `<div class="w-full mt-4 px-4 py-2 bg-gray-200 text-gray-500 font-semibold rounded-md text-center">🔒 Locked</div>`;
+                }
+                return `<div class="bg-white p-6 rounded-lg shadow-md"><h4 class="text-lg font-bold">${test.name}</h4><p class="text-sm text-gray-500 mt-1">${test.questionCount} Questions | ${test.timeLimit} Minutes</p>${button}</div>`;
+            }).join('');
+            
+            return `<main class="max-w-4xl mx-auto py-12 px-4 sm:px-6 lg:px-8"><h2 class="text-3xl font-bold text-center mb-2">${series.name}</h2><button class="block mx-auto text-sm text-indigo-600 hover:underline mb-8 website-home-link">← Back to All Exams</button>${purchaseSectionHtml}<div class="space-y-4">${testCards || '<p class="text-center text-gray-500">No tests available for this exam yet.</p>'}</div></main>`;
+        }
+        
+        async function renderTestInterface(seriesId, testId) {
+            const series = testSeriesData.find(s => s.id === seriesId);
+            const test = currentTests.find(t => t.id === testId);
+            const questionsRef = collection(db, "testSeries", seriesId, "tests", testId, "questions");
+            const questionsSnapshot = await getDocs(questionsRef);
+            const questions = questionsSnapshot.docs.map(doc => ({id: doc.id, ...doc.data()}));
+            
+            window.currentTestQuestions = questions;
+            window.currentTestInfo = { seriesId, testId, seriesName: series.name, testName: test.name, markingScheme: series.markingScheme || "+1,0" };
+            window.userAnswers = new Array(questions.length).fill(null);
+            
+            const mainHTML = `<main class="max-w-4xl mx-auto py-12 px-4"><div id="test-container" class="bg-white p-6 rounded-lg shadow-xl">
+                        <div class="flex justify-between items-center border-b pb-4 mb-6">
+                            <h2 class="text-2xl font-bold">${test.name}</h2>
+                            <div id="timer-display" class="text-2xl font-bold text-red-500">00:00</div>
+                        </div>
+                        <div id="question-content"></div>
+                        <div id="test-navigation" class="flex justify-between mt-8"></div>
+                    </div></main>`;
+            
+            setTimeout(() => {
+                renderSingleQuestion(0);
+                const timeLimit = test.timeLimit || 60;
+                let timeRemaining = timeLimit * 60;
+                const timerEl = document.getElementById('timer-display');
+                if (timerEl) {
+                    timerEl.textContent = `${timeLimit.toString().padStart(2, '0')}:00`;
+                    timerInterval = setInterval(() => {
+                        timeRemaining--;
+                        const minutes = Math.floor(timeRemaining / 60);
+                        const seconds = timeRemaining % 60;
+                        if(timerEl) timerEl.textContent = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+                        if (timeRemaining <= 0) {
+                            if (timerInterval) clearInterval(timerInterval);
+                            handleTestSubmit();
+                        }
+                    }, 1000);
+                }
+            }, 0);
+
+            return mainHTML;
+        }
+
+        function renderSingleQuestion(index, lang = window.preferredLanguage) {
+            const questionContainer = document.getElementById('question-content');
+            const navContainer = document.getElementById('test-navigation');
+            if (!questionContainer || !navContainer) return;
+
+            window.currentQuestionIndex = index;
+            const question = window.currentTestQuestions[index];
+            const questionData = (question[lang] && question[lang].text) ? question[lang] : question.en;
+            
+            const optionsHtml = questionData.options.map((opt, i) => {
+                const isChecked = window.userAnswers[index] === i ? 'checked' : '';
+                return `<label class="block p-3 border rounded-md hover:bg-gray-50 cursor-pointer"><input type="radio" name="question-${index}" value="${i}" ${isChecked} class="mr-3"> ${opt}</label>`
+            }).join('');
+        
+            const otherLang = lang === 'en' ? 'hi' : 'en';
+            const switchLangText = lang === 'en' ? 'हिंदी में देखें' : 'View in English';
+            const langSwitchButton = question[otherLang] && question[otherLang].text ? `<button id="switch-lang-btn" data-lang="${otherLang}" class="text-sm text-indigo-600 hover:underline">${switchLangText}</button>` : '';
+
+            questionContainer.innerHTML = `
+                <div class="flex justify-between items-start">
+                    <div>
+                        <p class="font-semibold mb-1 text-gray-600">Question ${index + 1} of ${window.currentTestQuestions.length}</p>
+                        <p class="text-lg font-medium mb-4">${questionData.text}</p>
+                    </div>
+                    ${langSwitchButton}
+                </div>
+                <div class="space-y-3" data-question-index="${index}">${optionsHtml}</div>`;
+        
+            const prevDisabled = index === 0;
+            const isLastQuestion = index === window.currentTestQuestions.length - 1;
+
+            navContainer.innerHTML = `
+                <button id="prev-question-btn" ${prevDisabled ? 'disabled' : ''} class="px-6 py-2 bg-gray-300 text-gray-700 font-semibold rounded-md disabled:opacity-50 disabled:cursor-not-allowed">Previous</button>
+                ${isLastQuestion 
+                    ? `<button id="submit-test-btn" class="px-6 py-2 bg-green-600 text-white font-bold rounded-md hover:bg-green-700">Submit Test</button>`
+                    : `<button id="next-question-btn" class="px-6 py-2 bg-indigo-600 text-white font-semibold rounded-md hover:bg-indigo-700">Next</button>`
+                }`;
+        }
+
+        async function renderResultsPage(resultId) {
+            const resultDoc = await getDoc(doc(db, "results", resultId));
+            if(!resultDoc.exists()) return `<main><p>Result not found.</p></main>`;
+            const resultData = resultDoc.data();
+
+            const questionsRef = collection(db, "testSeries", resultData.seriesId, "tests", resultData.testId, "questions");
+            const questionsSnapshot = await getDocs(questionsRef);
+            window.reviewQuestions = questionsSnapshot.docs.map(doc => ({id: doc.id, ...doc.data()}));
+
+            const leaderboardQuery = query(collection(db, "results"), where("testId", "==", resultData.testId));
+            const leaderboardSnapshot = await getDocs(leaderboardQuery);
+            
+            const allResults = leaderboardSnapshot.docs.map(doc => doc.data());
+            allResults.sort((a, b) => b.score - a.score);
+            const top20Results = allResults.slice(0, 20);
+
+            const leaderboardHtml = top20Results.map((data, i) => `<tr class="${data.userId === currentUser.uid ? 'bg-indigo-100 font-bold' : 'bg-white'}"><td class="p-3">${i + 1}</td><td class="p-3">${data.userName}</td><td class="p-3">${data.score}</td></tr>`).join('');
+
+            return `<main class="max-w-7xl mx-auto py-12 px-4 sm:px-6 lg:px-8 grid grid-cols-1 lg:grid-cols-3 gap-8">
+                        <div class="lg:col-span-2 bg-white p-8 rounded-lg shadow-xl">
+                            <h2 class="text-3xl font-bold text-indigo-600">Test Report: ${resultData.testName}</h2>
+                             <button id="analyze-performance-btn" data-result-id="${resultId}" class="w-full my-6 px-6 py-3 bg-gradient-to-r from-purple-500 to-indigo-600 text-white font-bold rounded-md hover:opacity-90 flex items-center justify-center">✨ Analyze My Performance & Get Study Plan</button>
+                            <div class="mt-8 grid grid-cols-1 md:grid-cols-3 gap-6 text-center">
+                                <div class="p-4 bg-green-100 rounded-lg"><p class="text-3xl font-bold text-green-800">${resultData.correct}</p><p class="text-sm text-green-600">Correct</p></div>
+                                <div class="p-4 bg-red-100 rounded-lg"><p class="text-3xl font-bold text-red-800">${resultData.incorrect}</p><p class="text-sm text-red-600">Incorrect</p></div>
+                                <div class="p-4 bg-gray-100 rounded-lg"><p class="text-3xl font-bold text-gray-800">${resultData.skipped}</p><p class="text-sm text-gray-600">Skipped</p></div>
+                            </div>
+                            <div class="mt-12 text-center"><p class="text-lg text-gray-600">Your Final Score:</p><p class="text-7xl font-bold text-gray-800 my-2">${resultData.score}</p></div>
+                            <hr class="my-8">
+                            <button id="start-review-btn" data-result-id="${resultId}" class="w-full px-6 py-3 bg-gray-800 text-white font-bold rounded-md hover:bg-black">Review Your Answers</button>
+                        </div>
+                        <div class="bg-white p-6 rounded-lg shadow-lg">
+                            <h3 class="text-xl font-bold mb-4 text-center">Top 20 Rankers</h3>
+                            <table class="w-full text-left"><thead class="bg-gray-50"><tr><th class="p-3">Rank</th><th class="p-3">Name</th><th class="p-3">Score</th></tr></thead><tbody class="divide-y">${leaderboardHtml}</tbody></table>
+                        </div>
+                    </main>`;
+        }
+        
+        async function renderReviewInterface(resultId) {
+            const resultDoc = await getDoc(doc(db, "results", resultId));
+            if(!resultDoc.exists()) return `<main><p>Result not found.</p></main>`;
+            const resultData = resultDoc.data();
+
+            const questionsRef = collection(db, "testSeries", resultData.seriesId, "tests", resultData.testId, "questions");
+            const questionsSnapshot = await getDocs(questionsRef);
+            const questions = questionsSnapshot.docs.map(doc => ({id: doc.id, ...doc.data()}));
+            
+            window.reviewQuestions = questions;
+            window.reviewUserAnswers = resultData.userAnswers;
+
+            const mainHTML = `<main class="max-w-4xl mx-auto py-12 px-4">
+                <div id="review-container" class="bg-white p-6 rounded-lg shadow-xl">
+                    <div class="flex justify-between items-center border-b pb-4 mb-6">
+                        <h2 class="text-2xl font-bold">Review: ${resultData.testName}</h2>
+                        <button class="text-sm text-indigo-600 hover:underline website-home-link">← Back to Home</button>
+                    </div>
+                    <div id="review-question-content"></div>
+                    <div id="review-navigation" class="flex justify-between mt-8"></div>
+                </div>
+            </main>`;
+
+            setTimeout(() => renderSingleReviewQuestion(0), 0);
+            return mainHTML;
+        }
+
+        function renderSingleReviewQuestion(index, lang = window.preferredLanguage) {
+            const questionContainer = document.getElementById('review-question-content');
+            const navContainer = document.getElementById('review-navigation');
+            if (!questionContainer || !navContainer) return;
+
+            const question = window.reviewQuestions[index];
+            const userAnswer = window.reviewUserAnswers[index];
+            const questionData = (question[lang] && question[lang].text) ? question[lang] : question.en;
+            
+            const optionsDisplay = questionData.options.map((opt, j) => {
+                const isCorrect = j === question.correctAnswer;
+                const isSelected = j === userAnswer.selected;
+                let classes = 'p-3 border rounded-md';
+                if (isCorrect) classes += ' bg-green-100 border-green-400 font-semibold text-green-800';
+                else if (isSelected && !isCorrect) classes += ' bg-red-100 border-red-400 text-red-800';
+                return `<div class="${classes}">${opt}</div>`;
+            }).join('');
+
+            const notAttemptedBadge = userAnswer.selected === null ? '<span class="text-xs font-bold text-gray-500 bg-gray-200 px-2 py-1 rounded-full">Not Attempted</span>' : '';
+            const solution = (questionData.explanation || question.en.explanation) ? `<div class="mt-4 p-3 bg-gray-100 rounded-md text-sm text-gray-800">${questionData.explanation || question.en.explanation}</div>` : '';
+
+            questionContainer.innerHTML = `
+                <div class="flex justify-between items-start">
+                    <p class="font-semibold mb-1 text-gray-600">Question ${index + 1} of ${window.reviewQuestions.length}</p>
+                    ${notAttemptedBadge}
+                </div>
+                <p class="text-lg font-medium mb-4">${questionData.text}</p>
+                <div class="space-y-2">${optionsDisplay}</div>
+                <button class="text-sm text-indigo-600 hover:underline mt-4 show-solution-btn">Show Solution</button>
+                <div class="solution-container">${solution}</div>
+            `;
+
+            const prevDisabled = index === 0;
+            const isLastQuestion = index === window.reviewQuestions.length - 1;
+            navContainer.innerHTML = `
+                <button id="prev-review-btn" data-index="${index - 1}" ${prevDisabled ? 'disabled' : ''} class="px-6 py-2 bg-gray-300 text-gray-700 font-semibold rounded-md disabled:opacity-50 disabled:cursor-not-allowed">Previous</button>
+                <button id="next-review-btn" data-index="${index + 1}" ${isLastQuestion ? 'disabled' : ''} class="px-6 py-2 bg-indigo-600 text-white font-semibold rounded-md disabled:opacity-50 disabled:cursor-not-allowed">Next</button>
+            `;
+        }
+        
+        // --- MODALS ---
+        function openModal(content) { const modalContent = `<div class="fixed inset-0 bg-gray-800 bg-opacity-75 modal-overlay"></div><div class="bg-white rounded-lg shadow-xl transform transition-all sm:my-8 sm:max-w-lg sm:w-full m-4 overflow-y-auto max-h-[90vh]">${content}</div>`; modalContainer.innerHTML = modalContent; modalContainer.classList.remove('hidden'); modalContainer.classList.add('flex'); }
+        function closeModal() { modalContainer.classList.add('hidden'); modalContainer.classList.remove('flex'); modalContainer.innerHTML = ''; }
+        
+        async function showDetailsModal(seriesId) {
+            await loadSingleSeries(seriesId);
+            const series = testSeriesData.find(s => s.id === seriesId);
+            const demoTest = currentTests.find(t => t.isDemo);
+            const hasPurchased = currentUser?.courses?.includes(seriesId);
+
+            let demoButton = demoTest ? `<button data-series-id="${seriesId}" data-test-id="${demoTest.id}" class="w-full mt-4 px-4 py-2 bg-green-600 text-white font-semibold rounded-md hover:bg-green-700 start-test-btn">Attempt Free Demo</button>` : '<p class="text-sm text-center text-gray-500 mt-4">No demo test available for this course.</p>';
+            let purchaseButton = hasPurchased ? `<button data-series-id="${seriesId}" class="w-full mt-2 px-4 py-2 bg-indigo-600 text-white font-semibold rounded-md hover:bg-indigo-700 view-tests-btn">Go to Purchased Course</button>` : `<button data-series-id="${seriesId}" data-series-name="${series.name}" data-price="${series.price || 0}" class="w-full mt-2 px-4 py-2 bg-blue-600 text-white font-semibold rounded-md hover:bg-blue-700 buy-course-btn">Purchase Full Course (₹${series.price || 0})</button>`;
+            
+            const modalHTML = `<div class="p-6 sm:p-8"><h2 class="text-2xl font-bold text-center mb-4">${series.name}</h2>${demoButton}${purchaseButton}</div>`;
+            openModal(modalHTML);
+        }
+
+        async function showMyCoursesModal() {
+            if (!currentUser || !currentUser.courses || currentUser.courses.length === 0) {
+                openModal(`<div class="p-8 text-center"><h3 class="text-xl font-bold mb-4">My Courses</h3><p>You have not purchased any courses yet.</p></div>`);
+                return;
+            }
+            const purchasedCourses = testSeriesData.filter(series => currentUser.courses.includes(series.id));
+            const coursesHtml = purchasedCourses.map(series => `<a href="#" data-series-id="${series.id}" class="block p-4 border rounded-md hover:bg-gray-50 view-tests-btn">${series.name}</a>`).join('');
+            openModal(`<div class="p-8"><h3 class="text-xl font-bold mb-4">My Courses</h3><div class="space-y-3">${coursesHtml}</div></div>`);
+        }
+
+        function showLoginModal() {
+            const emojis = ['👨','👩','🧑','😎','🤓','😊','🚀','🧠','⚡️','💡','🎓','🏆'];
+            const emojiHtml = emojis.map(e => `<div class="emoji-item p-1 text-3xl text-center" data-emoji="${e}">${e}</div>`).join('');
+            const modalHTML = `
+                <div class="p-6 sm:p-8">
+                    <h2 id="modal-title" class="text-2xl font-bold text-center mb-6">Create Your Account</h2>
+                    <form id="signup-form">
+                        <div class="space-y-4">
+                            <div><label class="block text-sm font-medium text-gray-700">Choose Avatar</label><div class="emoji-grid mt-2">${emojiHtml}</div><input type="hidden" id="signup-avatar" required></div>
+                            <div><label for="signup-name" class="block text-sm font-medium text-gray-700">Full Name</label><input type="text" id="signup-name" required class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3"></div>
+                            <div><label for="signup-nickname" class="block text-sm font-medium text-gray-700">Nickname (Optional)</label><input type="text" id="signup-nickname" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3"></div>
+                            <div><label for="signup-mobile" class="block text-sm font-medium text-gray-700">Mobile Number</label><input type="tel" id="signup-mobile" required pattern="[0-9]{10}" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3"></div>
+                            <div><label for="signup-email" class="block text-sm font-medium text-gray-700">Email</label><input type="email" id="signup-email" required class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3"></div>
+                            <div><label for="signup-password" class="block text-sm font-medium text-gray-700">Password (min. 6 characters)</label><input type="password" id="signup-password" required minlength="6" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3"></div>
+                        </div>
+                        <button type="submit" class="w-full mt-6 px-4 py-2 bg-indigo-600 text-white font-semibold rounded-md hover:bg-indigo-700">Create Account</button>
+                    </form>
+                    <form id="login-form" class="hidden">
+                         <div class="space-y-4">
+                            <div><label for="login-email" class="block text-sm font-medium text-gray-700">Email</label><input type="email" id="login-email" required class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3"></div>
+                            <div><label for="login-password" class="block text-sm font-medium text-gray-700">Password</label><input type="password" id="login-password" required class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3"></div>
+                        </div>
+                        <button type="submit" class="w-full mt-6 px-4 py-2 bg-indigo-600 text-white font-semibold rounded-md hover:bg-indigo-700">Login</button>
+                    </form>
+                    <div class="relative flex py-5 items-center"><div class="flex-grow border-t border-gray-300"></div><span class="flex-shrink mx-4 text-gray-400">OR</span><div class="flex-grow border-t border-gray-300"></div></div>
+                    <button id="google-login-btn" class="w-full flex justify-center items-center px-4 py-2 border border-gray-300 rounded-md shadow-sm text-sm font-medium text-gray-700 bg-white hover:bg-gray-50"><img class="h-5 w-5 mr-2" src="https://upload.wikimedia.org/wikipedia/commons/c/c1/Google_%22G%22_logo.svg" alt="Google logo">Sign in with Google</button>
+                    <p id="toggle-text" class="text-center text-sm text-gray-600 mt-4">Already have an account? <a href="#" id="show-login" class="font-medium text-indigo-600 hover:underline">Login</a></p>
+                </div>`;
+             openModal(modalHTML);
+             attachModalListeners();
+        }
+
+        function showLanguageModal(seriesId, testId) {
+            openModal(`
+                <div class="p-8 text-center">
+                    <h3 class="text-2xl font-bold mb-6">Select Test Language</h3>
+                    <div class="flex justify-center space-x-4">
+                        <button class="px-8 py-3 bg-indigo-600 text-white font-semibold rounded-md hover:bg-indigo-700 start-test-with-lang-btn" data-lang="en" data-series-id="${seriesId}" data-test-id="${testId}">English</button>
+                        <button class="px-8 py-3 bg-green-600 text-white font-semibold rounded-md hover:bg-green-700 start-test-with-lang-btn" data-lang="hi" data-series-id="${seriesId}" data-test-id="${testId}">हिंदी</button>
+                    </div>
+                </div>
+            `);
+        }
+
+        function attachModalListeners() {
+            const modal = modalContainer; // Listen on the container, not the content
+            if (!modal) return;
+            modal.addEventListener('click', (e) => {
+                const target = e.target;
+                if (target.matches('.emoji-item')) {
+                    modal.querySelectorAll('.emoji-item').forEach(el => el.classList.remove('selected'));
+                    target.classList.add('selected');
+                    modal.querySelector('#signup-avatar').value = target.dataset.emoji;
+                }
+                if (target.matches('#show-login')) {
+                    e.preventDefault();
+                    modal.querySelector('#signup-form').classList.add('hidden');
+                    modal.querySelector('#login-form').classList.remove('hidden');
+                    modal.querySelector('#modal-title').innerText = 'Login to Your Account';
+                    modal.querySelector('#toggle-text').innerHTML = `Don't have an account? <a href="#" id="show-signup" class="font-medium text-indigo-600 hover:underline">Sign Up</a>`;
+                }
+                if (target.matches('#show-signup')) {
+                    e.preventDefault();
+                    modal.querySelector('#login-form').classList.add('hidden');
+                    modal.querySelector('#signup-form').classList.remove('hidden');
+                    modal.querySelector('#modal-title').innerText = 'Create Your Account';
+                    modal.querySelector('#toggle-text').innerHTML = `Already have an account? <a href="#" id="show-login" class="font-medium text-indigo-600 hover:underline">Login</a>`;
+                }
+                if (target.matches('#google-login-btn')) handleGoogleLogin();
+                if (target.closest('.start-test-with-lang-btn')) {
+                    const { seriesId, testId, lang } = target.closest('.start-test-with-lang-btn').dataset;
+                    window.preferredLanguage = lang;
+                    closeModal();
+                    navigateTo('takeTest', { seriesId, testId });
+                }
+            });
+             modal.addEventListener('submit', (e) => {
+                if (e.target.matches('#signup-form')) handleSignup(e);
+                if (e.target.matches('#login-form')) handleLogin(e);
+             });
+        }
+        
+        // --- EVENT HANDLERS & AUTH LOGIC ---
+        async function handleGoogleLogin() {
+             try {
+                const result = await signInWithPopup(auth, googleProvider);
+                const user = result.user;
+                const userDocRef = doc(db, "users", user.uid);
+                const userDoc = await getDoc(userDocRef);
+                if (!userDoc.exists()) {
+                    await setDoc(userDocRef, { name: user.displayName, email: user.email, avatar: '🧑', courses: [] });
+                }
+                closeModal();
+            } catch (error) { alert("Google Sign-In failed. Please try again."); }
+        }
+        async function handleSignup(e) {
+            e.preventDefault();
+            const form = e.target;
+            const name = form.querySelector('#signup-name').value;
+            const nickname = form.querySelector('#signup-nickname').value;
+            const mobile = form.querySelector('#signup-mobile').value;
+            const email = form.querySelector('#signup-email').value;
+            const password = form.querySelector('#signup-password').value;
+            const avatar = form.querySelector('#signup-avatar').value;
+            if (!avatar) { alert('Please choose an avatar.'); return; }
+            try {
+                const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+                await setDoc(doc(db, "users", userCredential.user.uid), { name, nickname, email, mobile, avatar, courses: [] });
+                closeModal();
+            } catch (error) { alert(error.message); }
+        }
+        async function handleLogin(e) {
+            e.preventDefault();
+            const form = e.target;
+            const email = form.querySelector('#login-email').value;
+            const password = form.querySelector('#login-password').value;
+            try {
+                await signInWithEmailAndPassword(auth, email, password);
+                closeModal();
+            } catch (error) { alert(error.message); }
+        }
+
+        async function handleTestSubmit() {
+            if (timerInterval) clearInterval(timerInterval);
+            let correct = 0, incorrect = 0;
+            const schemeString = window.currentTestInfo.markingScheme || "+1,0";
+            const markingParts = schemeString.split(',').map(Number);
+            const marksCorrect = !isNaN(markingParts[0]) ? markingParts[0] : 1;
+            const marksIncorrect = !isNaN(markingParts[1]) ? markingParts[1] : 0;
+            const userAnswersForDB = window.userAnswers.map(ans => ({ selected: ans }));
+
+            window.currentTestQuestions.forEach((q, index) => {
+                const selectedValue = window.userAnswers[index];
+                if (selectedValue !== null) {
+                    if (selectedValue === q.correctAnswer) correct++;
+                    else incorrect++;
+                }
+            });
+            const score = (correct * marksCorrect) + (incorrect * marksIncorrect);
+            const resultData = { userId: currentUser.uid, userName: currentUser.name || currentUser.email, seriesId: window.currentTestInfo.seriesId, testId: window.currentTestInfo.testId, testName: window.currentTestInfo.testName, score, correct, incorrect, skipped: window.currentTestQuestions.length - (correct + incorrect), timestamp: new Date(), userAnswers: userAnswersForDB };
+            const resultRef = await addDoc(collection(db, "results"), resultData);
+            navigateTo('results', { resultId: resultRef.id });
+        }
+
+        // --- MASTER EVENT LISTENER (DELEGATION) ---
+        document.addEventListener('click', async e => {
+            const target = e.target;
+            
+            if (target.closest('.modal-overlay')) closeModal();
+            if (target.closest('.website-home-link')) { e.preventDefault(); navigateTo('website'); }
+            if (target.closest('#login-modal-btn')) showLoginModal();
+            if (target.closest('#logout-btn')) { await signOut(auth); }
+            if (target.closest('#my-courses-btn')) showMyCoursesModal();
+            if (target.closest('.view-details-btn')) showDetailsModal(target.closest('.view-details-btn').dataset.seriesId);
+            if (target.closest('.view-tests-btn')) {
+                closeModal();
+                navigateTo('testList', { seriesId: target.closest('.view-tests-btn').dataset.seriesId });
+            }
+            if (target.closest('.start-test-btn')) { 
+                if (!currentUser) { showLoginModal(); return; } 
+                const { seriesId, testId } = target.closest('.start-test-btn').dataset;
+                
+                // NEW: Check if test was already attempted
+                const resultsQuery = query(collection(db, "results"), where("userId", "==", currentUser.uid), where("testId", "==", testId), limit(1));
+                const existingResult = await getDocs(resultsQuery);
+
+                if (!existingResult.empty) {
+                    alert("You have already attempted this test. Showing your previous results.");
+                    navigateTo('results', { resultId: existingResult.docs[0].id });
+                } else {
+                    showLanguageModal(seriesId, testId);
+                }
+            }
+            if (target.matches('#switch-lang-btn')) {
+                renderSingleQuestion(window.currentQuestionIndex, target.dataset.lang);
+            }
+            if (target.matches('#prev-question-btn')) {
+                if (window.currentQuestionIndex > 0) {
+                    renderSingleQuestion(window.currentQuestionIndex - 1);
+                }
+            }
+            if (target.matches('#next-question-btn')) {
+                if (window.currentQuestionIndex < window.currentTestQuestions.length - 1) {
+                    renderSingleQuestion(window.currentQuestionIndex + 1);
+                }
+            }
+            if (target.matches('#submit-test-btn')) handleTestSubmit();
+
+            if (target.matches('#start-review-btn')) {
+                navigateTo('reviewTest', { resultId: target.dataset.resultId });
+            }
+            if (target.matches('#prev-review-btn')) {
+                renderSingleReviewQuestion(parseInt(target.dataset.index));
+            }
+            if (target.matches('#next-review-btn')) {
+                renderSingleReviewQuestion(parseInt(target.dataset.index));
+            }
+            if (target.matches('.show-solution-btn')) {
+                const solutionDiv = target.nextElementSibling;
+                if (solutionDiv) solutionDiv.style.display = 'block';
+                target.style.display = 'none';
+            }
+            if (target.closest('.buy-course-btn')) {
+                if (!currentUser) { showLoginModal(); return; }
+                const button = target.closest('.buy-course-btn');
+                const { seriesId, seriesName, price } = button.dataset;
+                const options = {
+                    key: "rzp_test_R9yMhgXvi9lw2p", amount: parseInt(price) * 100, currency: "INR",
+                    name: "Physical Education Academy", description: `Purchase: ${seriesName}`,
+                    handler: async function (response) {
+                        const userRef = doc(db, "users", currentUser.uid);
+                        await updateDoc(userRef, { courses: arrayUnion(seriesId) });
+                        alert("Payment Successful! Course unlocked.");
+                        closeModal();
+                        navigateTo('testList', { seriesId });
+                    },
+                    prefill: { name: currentUser.name, email: currentUser.email, contact: currentUser.mobile }
+                };
+                new Razorpay(options).open();
+            }
+            if (target.matches('.get-ai-explanation-btn')) {
+                const button = target;
+                const index = parseInt(button.dataset.questionIndex);
+                const question = window.currentTestQuestions[index];
+                const explanationContainer = document.getElementById(`explanation-${index}`);
+                button.disabled = true;
+                explanationContainer.innerHTML = `<p class="text-indigo-600 animate-pulse">✨ Generating explanation...</p>`;
+                const prompt = `You are an expert teacher. Explain the following multiple-choice question from a Physical Education test. Clearly explain the concept and why the correct answer is the right choice. Question: "${question.en.text}" Options: A) ${question.en.options[0]}, B) ${question.en.options[1]}, C) ${question.en.options[2]}, D) ${question.en.options[3]}. The correct answer is option ${['A','B','C','D'][question.correctAnswer]}.`;
+                const aiResponse = await callGeminiAPI(prompt);
+                explanationContainer.innerHTML = aiResponse.replace(/\n/g, '<br>');
+            }
+            if (target.matches('#analyze-performance-btn')) {
+                 const button = target;
+                 button.disabled = true;
+                 button.innerHTML = '✨ Analyzing...';
+                 const resultDoc = await getDoc(doc(db, "results", button.dataset.resultId));
+                 const resultData = resultDoc.data();
+                 const lang = window.preferredLanguage;
+                 const incorrectQuestionsText = resultData.userAnswers.map((ans, i) => {
+                     if (!window.reviewQuestions[i]) return null;
+                     const question = window.reviewQuestions[i];
+                     if (ans.selected === null || ans.selected === question.correctAnswer) return null;
+                     const questionData = question[lang] || question.en;
+                     return ` - ${questionData.text}`;
+                 }).filter(Boolean).join('\n');
+                 const langInstruction = lang === 'hi' ? 'IMPORTANT: Your entire response MUST be in Hindi.' : '';
+                 const prompt = `I am a student preparing for the "${resultData.testName}" exam. My results: ${resultData.correct} correct, ${resultData.incorrect} incorrect, ${resultData.skipped} skipped. Here are the questions I got wrong:\n${incorrectQuestionsText}\n\nBased on these incorrect answers, provide a concise analysis of my potential weak areas and suggest a simple, actionable 3-point study plan to help me improve. ${langInstruction}`;
+                 const aiResponse = await callGeminiAPI(prompt);
+                 openModal(`<div class="p-6"><h3 class="text-xl font-bold mb-4">✨ AI Performance Analysis</h3><div class="prose-styles text-gray-700">${aiResponse.replace(/\n/g, '<br>')}</div><div class="mt-6 text-right"><button class="px-4 py-2 bg-indigo-600 text-white rounded-md close-modal-btn">Close</button></div></div>`);
+                 button.disabled = false;
+                 button.innerHTML = '✨ Analyze My Performance & Get Study Plan';
+            }
+        });
+
+        document.addEventListener('change', e => {
+             if (e.target.matches('input[type="radio"]')) {
+                const questionContainer = e.target.closest('[data-question-index]');
+                if (questionContainer) {
+                    const questionIndex = parseInt(questionContainer.dataset.questionIndex, 10);
+                    window.userAnswers[questionIndex] = parseInt(e.target.value, 10);
+                }
+             }
+        });
+        
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                const userDoc = await getDoc(doc(db, "users", user.uid));
+                currentUser = userDoc.exists() ? { uid: user.uid, ...userDoc.data() } : { uid: user.uid, email: user.email, name: user.displayName };
+            } else { currentUser = null; }
+            if(document.getElementById('app-container')) {
+                navigateTo(currentView.name, currentView.props);
+            }
+        });
+        
+        navigateTo('website');
+    </script>
+</body>
+</html>
+

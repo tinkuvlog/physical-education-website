@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Panel - Physical Education Academy</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        .modal-active { overflow: hidden; }
+        #add-question-form, #import-text-form { max-height: 80vh; overflow-y: auto; }
+        .success-toast {
+            position: fixed; top: 20px; right: 20px; background-color: #28a745;
+            color: white; padding: 1rem; border-radius: 0.5rem; z-index: 1000;
+            opacity: 0; transition: opacity 0.5s ease-in-out;
+        }
+        .success-toast.show { opacity: 1; }
+    </style>
+</head>
+<body class="bg-gray-100">
+
+    <div id="app-container"></div>
+    <div id="toast-container"></div>
+
+    <div id="modal-container" class="fixed inset-0 z-50 items-center justify-center hidden"></div>
+
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getFirestore, collection, doc, getDocs, getDoc, setDoc, updateDoc, deleteDoc, writeBatch, query, orderBy, addDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        const firebaseConfig = {
+          apiKey: "AIzaSyDb-J-XzriOr51DzDX6tM2HiRAQV_LKhto",
+          authDomain: "physical-education-academy.firebaseapp.com",
+          projectId: "physical-education-academy",
+          storageBucket: "physical-education-academy.appspot.com",
+          messagingSenderId: "42844156937",
+          appId: "1:42844156937:web:3e7d8f77ed53d2fdc1f4d8",
+          measurementId: "G-RH6LRMTNNZ"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const db = getFirestore(app);
+
+        let testSeriesData = [];
+        let currentTests = [];
+        
+        const appContainer = document.getElementById('app-container');
+        const modalContainer = document.getElementById('modal-container');
+        const toastContainer = document.getElementById('toast-container');
+
+        // --- GEMINI API FUNCTION FOR TRANSLATION ---
+        async function callGeminiForTranslation(promptText, isBulk = false) {
+            const apiKey = ""; // API key is handled by the environment
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+            
+            let prompt;
+            let generationConfig = {};
+
+            if (isBulk) {
+                prompt = `You are a professional translator. For each block separated by '---', translate the QUESTION_EN, OPTION_EN, and EXPLANATION_EN values to Hindi and create corresponding QUESTION_HI, OPTION_HI, and EXPLANATION_HI key-value pairs. Maintain the original structure. Respond with ONLY the translated text blocks, each separated by '---'.\n\n${promptText}`;
+            } else {
+                prompt = `Translate the following JSON object's string values from English to Hindi. Respond with ONLY the translated JSON object, maintaining the exact same structure.\n\n${JSON.stringify(promptText)}`;
+                generationConfig = { responseMimeType: "application/json" };
+            }
+            
+            const payload = { contents: [{ parts: [{ text: prompt }] }], generationConfig };
+
+            try {
+                const response = await fetch(apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                if (!response.ok) throw new Error(`API call failed with status: ${response.status}`);
+                const result = await response.json();
+                let textResponse = result.candidates?.[0]?.content?.parts?.[0]?.text;
+                
+                if (textResponse) {
+                    if (isBulk) return textResponse;
+                    const jsonMatch = textResponse.match(/```json\s*([\s\S]*?)\s*```|({[\s\S]*})/);
+                    if (jsonMatch && jsonMatch[1]) textResponse = jsonMatch[1];
+                    else if (jsonMatch && jsonMatch[2]) textResponse = jsonMatch[2];
+                    try { return JSON.parse(textResponse); } 
+                    catch (e) { throw new Error("Invalid JSON response from AI."); }
+                }
+                throw new Error("Invalid response structure from API.");
+            } catch (error) {
+                console.error("Gemini translation error:", error);
+                alert("An error occurred during translation. Please check the console.");
+                return null;
+            }
+        }
+
+        function showToast(message) {
+            const toast = document.createElement('div');
+            toast.className = 'success-toast';
+            toast.textContent = message;
+            toastContainer.appendChild(toast);
+            setTimeout(() => { toast.classList.add('show'); }, 10);
+            setTimeout(() => {
+                toast.classList.remove('show');
+                setTimeout(() => { toast.remove(); }, 500);
+            }, 3000);
+        }
+
+        async function navigateTo(view, props = {}) {
+            appContainer.innerHTML = '<div class="text-center p-12">Loading...</div>';
+            switch(view) {
+                case 'admin':
+                    await loadAllTestSeries();
+                    appContainer.innerHTML = renderAdminDashboard();
+                    break;
+                case 'editSeries':
+                     await loadSingleSeries(props.seriesId);
+                     appContainer.innerHTML = renderEditSeriesView(props.seriesId);
+                     break;
+                case 'manageQuestions':
+                    await loadSingleSeries(props.seriesId);
+                    appContainer.innerHTML = await renderManageQuestionsView(props.seriesId, props.testId);
+                    break;
+            }
+        }
+        
+        async function loadAllTestSeries() {
+            const seriesQuery = query(collection(db, "testSeries"), orderBy("order", "desc"));
+            const querySnapshot = await getDocs(seriesQuery);
+            testSeriesData = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        }
+
+        async function loadSingleSeries(seriesId) {
+             const seriesRef = doc(db, "testSeries", seriesId);
+             const seriesSnap = await getDoc(seriesRef);
+             const seriesData = seriesSnap.exists() ? { id: seriesId, ...seriesSnap.data() } : null;
+
+             const testsQuery = query(collection(db, "testSeries", seriesId, "tests"), orderBy("order"));
+             const testsSnapshot = await getDocs(testsQuery);
+             currentTests = testsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+             const existingIndex = testSeriesData.findIndex(s => s.id === seriesId);
+             if (existingIndex > -1) {
+                 if (seriesData) testSeriesData[existingIndex] = seriesData;
+             } else if(seriesData) {
+                 testSeriesData.push(seriesData);
+             }
+        }
+
+        function renderAdminHeader(title, backButton = null) {
+            const backButtonHtml = backButton ? `<button data-view="${backButton.view}" data-series-id="${backButton.seriesId || ''}" class="text-sm text-indigo-600 hover:underline back-btn">${backButton.text}</button>` : '';
+            return `<header class="bg-white shadow-md"><div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8"><div class="flex justify-between items-center h-16"><h1 class="text-2xl font-bold text-indigo-600">${title}</h1>${backButtonHtml}</div></div></header>`;
+        }
+
+
+        function renderAdminDashboard() {
+            const header = renderAdminHeader('Admin Dashboard');
+            const seriesListHtml = testSeriesData.map(series => `<div class="p-4 border rounded-md flex justify-between items-center"><h3 class="font-bold text-lg">${series.name}</h3><div class="space-x-2"><button data-series-id="${series.id}" class="px-4 py-2 bg-indigo-600 text-white text-sm rounded-md hover:bg-indigo-700 manage-series-btn">Manage</button><button data-series-id="${series.id}" class="px-4 py-2 bg-red-600 text-white text-sm rounded-md hover:bg-red-700 delete-series-btn">Delete</button></div></div>`).join('') || '<p class="text-center text-gray-500 py-4">No exams added yet.</p>';
+            const main = `<main class="max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8"><div class="bg-white p-6 rounded-lg shadow-lg"><div class="flex justify-between items-center mb-4"><h2 class="text-2xl font-bold text-gray-800">Manage Exams</h2><button id="add-series-btn" class="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700">Add New Exam</button></div><div class="space-y-4">${seriesListHtml}</div></div></main>`;
+            return header + main;
+        }
+        
+        function renderEditSeriesView(seriesId) {
+            const series = testSeriesData.find(s => s.id === seriesId);
+            if (!series) { navigateTo('admin'); return ''; }
+            
+            const header = renderAdminHeader(`Manage: ${series.name}`, { text: '← Back to Dashboard', view: 'admin' });
+
+            const testsHtml = currentTests.map((test, index) => {
+                 const isFirst = index === 0;
+                 const isLast = index === currentTests.length - 1;
+                return `<div class="p-3 border rounded-md flex justify-between items-center">
+                     <div class="flex items-center space-x-3">
+                        <div class="flex flex-col space-y-1">
+                            <button data-series-id="${seriesId}" data-index="${index}" class="move-test-btn ${isFirst ? 'text-gray-300 cursor-not-allowed' : 'text-gray-600 hover:text-black'}" ${isFirst ? 'disabled' : ''} data-direction="up">▲</button>
+                            <button data-series-id="${seriesId}" data-index="${index}" class="move-test-btn ${isLast ? 'text-gray-300 cursor-not-allowed' : 'text-gray-600 hover:text-black'}" ${isLast ? 'disabled' : ''} data-direction="down">▼</button>
+                        </div>
+                        <div><p class="font-semibold">${test.name} ${test.isDemo ? '<span class="text-xs bg-yellow-200 text-yellow-800 font-bold px-2 py-1 rounded-full">DEMO</span>' : ''}</p><p class="text-xs text-gray-500">${test.questionCount} Questions | ${test.timeLimit} Minutes</p></div>
+                    </div>
+                    <div class="space-x-2">
+                         <button data-series-id="${seriesId}" data-test-id="${test.id}" class="text-xs px-2 py-1 bg-gray-200 rounded hover:bg-gray-300 manage-questions-btn">Manage Questions</button>
+                         <button data-series-id="${seriesId}" data-test-id="${test.id}" class="text-xs px-2 py-1 bg-red-100 text-red-800 rounded hover:bg-red-200 delete-test-btn">Delete Test</button>
+                    </div>
+                </div>`;
+            }).join('');
+            
+            const main = `<main class="max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8 grid grid-cols-1 md:grid-cols-3 gap-8">
+                    <div class="md:col-span-2 bg-white p-6 rounded-lg shadow-lg">
+                        <h2 class="text-xl font-bold text-gray-800 mb-4">Tests in this Exam</h2>
+                        <button id="add-test-btn" data-series-id="${seriesId}" class="mb-4 w-full px-4 py-2 bg-green-600 text-white text-sm rounded-md hover:bg-green-700">Add New Test</button>
+                        <div class="space-y-3">${testsHtml || '<p class="text-center text-gray-500 py-4">No tests added yet.</p>'}</div>
+                    </div>
+                    <div class="bg-white p-6 rounded-lg shadow-lg h-fit">
+                        <h2 class="text-xl font-bold text-gray-800 mb-4">Exam Settings</h2>
+                        <form id="series-settings-form" data-series-id="${seriesId}" class="space-y-4">
+                            <div><label for="series-name" class="block text-sm font-medium text-gray-700">Exam Name</label><input type="text" id="series-name" value="${series.name || ''}" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3" required></div>
+                            <div><label for="series-price" class="block text-sm font-medium text-gray-700">Price (INR)</label><input type="number" id="series-price" value="${series.price || 0}" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3" required></div>
+                            <div><label for="series-image-url" class="block text-sm font-medium text-gray-700">Image URL</label><input type="url" id="series-image-url" value="${series.imageUrl || ''}" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3"></div>
+                            <div><label for="series-marking-scheme" class="block text-sm font-medium text-gray-700">Marking Scheme (+Correct, -Incorrect)</label><input type="text" id="series-marking-scheme" value="${series.markingScheme || '+1,0'}" placeholder="+4,-1" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3" required></div>
+                            <button type="submit" class="w-full px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700">Save Settings</button>
+                        </form>
+                    </div>
+                </main>`;
+            
+            return header + main;
+        }
+        
+        async function renderManageQuestionsView(seriesId, testId) {
+             const test = currentTests.find(t => t.id === testId);
+             if (!test) return '';
+             
+             const header = renderAdminHeader(`Manage Questions: ${test.name}`, { text: '← Back to Exam', view: 'editSeries', seriesId: seriesId });
+             
+             // FIXED: Removed orderBy from the query
+             const questionsColRef = collection(db, "testSeries", seriesId, "tests", testId, "questions");
+             const questionsSnapshot = await getDocs(questionsColRef);
+             
+             // FIXED: Sort the documents in JavaScript after fetching
+             const questionDocs = questionsSnapshot.docs;
+             questionDocs.sort((a, b) => (a.data().q_no || 0) - (b.data().q_no || 0));
+
+             const questionsHtml = questionDocs.map((doc) => {
+                const questionData = doc.data();
+                const hasHindi = questionData.hi && questionData.hi.text;
+                return `<div class="p-3 border rounded-md flex justify-between items-center">
+                            <div class="flex items-center gap-3">
+                                <p class="font-semibold text-sm">Q${questionData.q_no}: ${questionData.en.text}</p>
+                                ${hasHindi ? '<span class="text-xs font-bold text-green-700 bg-green-100 px-2 py-1 rounded-full">EN / HI</span>' : ''}
+                            </div>
+                            <div class="space-x-2">
+                                <button data-series-id="${seriesId}" data-test-id="${testId}" data-question-id="${doc.id}" class="text-xs px-2 py-1 bg-gray-200 rounded hover:bg-gray-300 edit-question-btn">Edit</button>
+                                <button data-series-id="${seriesId}" data-test-id="${testId}" data-question-id="${doc.id}" class="text-xs px-2 py-1 bg-red-100 text-red-800 rounded hover:bg-red-200 delete-question-btn">Delete</button>
+                            </div>
+                        </div>`;
+             }).join('') || '<p class="text-center text-gray-500 py-4">No questions added yet.</p>';
+
+             const main = `<main class="max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8"><div class="bg-white p-6 rounded-lg shadow-lg mb-8"><div class="flex justify-between items-center mb-4"><h2 class="text-xl font-bold text-gray-800">Question List</h2><div class="space-x-2"><button data-series-id="${seriesId}" data-test-id="${test.id}" id="import-from-text-btn" class="px-4 py-2 bg-blue-600 text-white text-sm rounded-md hover:bg-blue-700">Import from Text</button><button data-series-id="${seriesId}" data-test-id="${test.id}" id="add-manual-question-btn" data-count="${questionsSnapshot.docs.length}" class="px-4 py-2 bg-green-600 text-white text-sm rounded-md hover:bg-green-700">Add Question Manually</button></div></div><div id="question-list-container" class="space-y-3">${questionsHtml}</div></div></main>`;
+             
+             return header + main;
+        }
+        
+        // --- MODALS ---
+        function openModal(content) { const modalContent = `<div class="fixed inset-0 bg-gray-800 bg-opacity-75 modal-overlay"></div><div class="bg-white rounded-lg shadow-xl transform transition-all sm:my-8 sm:max-w-4xl sm:w-full m-4"><div id="modal-content-inner" class="p-6 overflow-y-auto max-h-[85vh]">${content}</div></div>`; modalContainer.innerHTML = modalContent; modalContainer.classList.remove('hidden'); modalContainer.classList.add('flex'); }
+        function closeModal() { modalContainer.classList.add('hidden'); modalContainer.classList.remove('flex'); modalContainer.innerHTML = ''; }
+        function showConfirmation(message, onConfirm) {
+            openModal(`<div class="p-6 text-center"><p class="text-lg font-medium">${message}</p><div class="mt-6 flex justify-center space-x-4"><button type="button" class="px-6 py-2 bg-gray-200 rounded-md hover:bg-gray-300 close-modal-btn">Cancel</button><button id="confirm-ok" type="button" class="px-6 py-2 bg-red-500 text-white rounded-md hover:bg-red-600">OK</button></div></div>`);
+            document.getElementById('confirm-ok').onclick = () => { closeModal(); onConfirm(); };
+        }
+        function showAddTestModal(seriesId) {
+            openModal(`<form id="add-test-form" data-series-id="${seriesId}" class="space-y-4"> <h3 class="text-2xl font-bold mb-4">Add New Test</h3> <div><label for="test-name" class="block text-sm font-medium text-gray-700">Test Name</label><input type="text" id="test-name" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3" required></div><div><label for="test-questions" class="block text-sm font-medium text-gray-700">Total Number of Questions</label><input type="number" id="test-questions" value="50" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3" required></div><div><label for="test-time" class="block text-sm font-medium text-gray-700">Time Limit (in Minutes)</label><input type="number" id="test-time" value="60" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3" required></div><div class="flex items-center"><input id="is-demo" type="checkbox" class="h-4 w-4 text-indigo-600 border-gray-300 rounded"><label for="is-demo" class="ml-2 block text-sm text-gray-900">Make this a Free Demo Test</label></div><div class="flex justify-end space-x-3 pt-4"><button type="button" class="px-4 py-2 bg-gray-200 rounded-md close-modal-btn">Cancel</button><button type="submit" class="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700">Add Test</button></div></form>`);
+        }
+        function showImportFromTextModal(seriesId, testId) {
+             openModal(`<form id="import-text-form" data-series-id="${seriesId}" data-test-id="${testId}" class="space-y-4"><h3 class="text-2xl font-bold mb-2">Import from Text</h3><p class="text-sm text-gray-600 mb-4">Paste questions in the specified format. Each question must start with "Q: [number]".</p><div><textarea id="text-import-area" rows="15" class="w-full border p-2 rounded-md font-mono text-sm" placeholder="Q: 1\nQUESTION_EN: ...\nOPTION_EN: ..."></textarea></div><div class="flex justify-between items-center pt-4"><button type="button" id="translate-bulk-btn" class="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600">✨ Auto-translate English to Hindi</button><div class="space-x-3"><button type="button" class="px-4 py-2 bg-gray-200 rounded-md close-modal-btn">Cancel</button><button type="submit" class="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700">Import Questions</button></div></div></form>`);
+        }
+        
+        function showQuestionFormModal(seriesId, testId, questionData = null, count = 0) {
+            const isEditing = !!questionData;
+            const title = isEditing ? `Edit Question #${questionData.q_no}` : `Add Question Manually (Question #${count + 1})`;
+            const buttonText = isEditing ? 'Save Changes' : 'Add This Question';
+            const formId = isEditing ? 'edit-manual-question-form' : 'add-manual-question-form';
+
+            const en = questionData?.en || { text: '', options: ['', '', '', ''], explanation: '' };
+            const hi = questionData?.hi || { text: '', options: ['', '', '', ''], explanation: '' };
+            const qNo = questionData?.q_no || count + 1;
+            
+            openModal(`
+                <form id="${formId}" data-series-id="${seriesId}" data-test-id="${testId}" ${isEditing ? `data-question-id="${questionData.id}"` : ''} class="space-y-6">
+                    <h3 class="text-2xl font-bold">${title}</h3>
+                    <div><label for="q-no" class="block text-sm font-medium">Question Number</label><input type="number" id="q-no" value="${qNo}" required class="mt-1 block w-full border p-2"></div>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                        <div class="space-y-4 p-4 border rounded-md">
+                            <h4 class="font-semibold text-lg text-gray-800">English Content (Required)</h4>
+                            <div><label for="q-en-text" class="block text-sm font-medium">Question</label><textarea id="q-en-text" rows="3" required class="mt-1 block w-full border p-2">${en.text}</textarea></div>
+                            <div><label for="q-en-opt1" class="block text-sm font-medium">Option 1</label><input type="text" id="q-en-opt1" value="${en.options[0]}" required class="mt-1 block w-full border p-2"></div>
+                            <div><label for="q-en-opt2" class="block text-sm font-medium">Option 2</label><input type="text" id="q-en-opt2" value="${en.options[1]}" required class="mt-1 block w-full border p-2"></div>
+                            <div><label for="q-en-opt3" class="block text-sm font-medium">Option 3</label><input type="text" id="q-en-opt3" value="${en.options[2]}" required class="mt-1 block w-full border p-2"></div>
+                            <div><label for="q-en-opt4" class="block text-sm font-medium">Option 4</label><input type="text" id="q-en-opt4" value="${en.options[3]}" required class="mt-1 block w-full border p-2"></div>
+                            <div><label for="q-en-exp" class="block text-sm font-medium">Explanation (Optional)</label><textarea id="q-en-exp" rows="2" class="mt-1 block w-full border p-2">${en.explanation}</textarea></div>
+                        </div>
+                        <div class="space-y-4 p-4 border rounded-md bg-gray-50">
+                            <h4 class="font-semibold text-lg text-gray-800 flex justify-between items-center"><span>Hindi Content (Optional)</span><button type="button" id="translate-to-hindi-btn" class="px-2 py-1 text-xs bg-blue-500 text-white rounded hover:bg-blue-600">✨ Auto-translate</button></h4>
+                             <div><label for="q-hi-text" class="block text-sm font-medium">Question (Hindi)</label><textarea id="q-hi-text" rows="3" class="mt-1 block w-full border p-2">${hi.text}</textarea></div>
+                            <div><label for="q-hi-opt1" class="block text-sm font-medium">Option 1 (Hindi)</label><input type="text" id="q-hi-opt1" value="${hi.options[0]}" class="mt-1 block w-full border p-2"></div>
+                            <div><label for="q-hi-opt2" class="block text-sm font-medium">Option 2 (Hindi)</label><input type="text" id="q-hi-opt2" value="${hi.options[1]}" class="mt-1 block w-full border p-2"></div>
+                            <div><label for="q-hi-opt3" class="block text-sm font-medium">Option 3 (Hindi)</label><input type="text" id="q-hi-opt3" value="${hi.options[2]}" class="mt-1 block w-full border p-2"></div>
+                            <div><label for="q-hi-opt4" class="block text-sm font-medium">Option 4 (Hindi)</label><input type="text" id="q-hi-opt4" value="${hi.options[3]}" class="mt-1 block w-full border p-2"></div>
+                            <div><label for="q-hi-exp" class="block text-sm font-medium">Explanation (Hindi)</label><textarea id="q-hi-exp" rows="2" class="mt-1 block w-full border p-2">${hi.explanation}</textarea></div>
+                        </div>
+                    </div>
+                    <div><label for="correct-answer" class="block text-sm font-medium">Correct Answer</label><select id="correct-answer" required class="mt-1 block w-full border p-2"><option value="0">Option 1</option><option value="1">Option 2</option><option value="2">Option 3</option><option value="3">Option 4</option></select></div>
+                    <div class="flex justify-end space-x-3 pt-4"><button type="button" class="px-4 py-2 bg-gray-200 rounded-md close-modal-btn">Cancel</button><button type="submit" class="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700">${buttonText}</button></div>
+                </form>`);
+            if (isEditing) document.getElementById('correct-answer').value = questionData.correctAnswer;
+        }
+        
+        // --- EVENT LISTENERS & LOGIC ---
+        document.addEventListener('click', async e => {
+            const target = e.target;
+            if (target.closest('.modal-overlay') || target.closest('.close-modal-btn')) closeModal();
+            if (target.closest('.back-btn')) {
+                const { view, seriesId } = target.dataset;
+                navigateTo(view, { seriesId });
+            }
+            if (target.closest('.admin-home-link')) { e.preventDefault(); navigateTo('admin'); }
+            
+            if (target.closest('#add-series-btn')) {
+                const newSeriesRef = doc(collection(db, "testSeries"));
+                await setDoc(newSeriesRef, { name: "New Exam (Click Manage to Edit)", price: 0, order: Date.now() });
+                navigateTo('admin');
+            }
+            if (target.closest('.manage-series-btn')) navigateTo('editSeries', { seriesId: target.closest('.manage-series-btn').dataset.seriesId });
+            if (target.closest('.delete-series-btn')) {
+                const seriesId = target.closest('.delete-series-btn').dataset.seriesId;
+                showConfirmation("Delete this entire exam series? This cannot be undone.", async () => {
+                    await deleteDoc(doc(db, "testSeries", seriesId));
+                    navigateTo('admin');
+                });
+            }
+            if (target.closest('#add-test-btn')) showAddTestModal(target.closest('#add-test-btn').dataset.seriesId);
+            if (target.closest('.delete-test-btn')) {
+                const { seriesId, testId } = target.closest('.delete-test-btn').dataset;
+                showConfirmation("Delete this test? All questions will be lost.", async () => {
+                    await deleteDoc(doc(db, "testSeries", seriesId, "tests", testId));
+                    navigateTo('editSeries', { seriesId });
+                });
+            }
+             if (target.closest('.move-test-btn')) {
+                const { seriesId, index, direction } = target.closest('.move-test-btn').dataset;
+                const idx = parseInt(index);
+                const toIndex = direction === 'up' ? idx - 1 : idx + 1;
+
+                if (toIndex >= 0 && toIndex < currentTests.length) {
+                    const batch = writeBatch(db);
+                    const test1Ref = doc(db, "testSeries", seriesId, "tests", currentTests[idx].id);
+                    const test2Ref = doc(db, "testSeries", seriesId, "tests", currentTests[toIndex].id);
+                    batch.update(test1Ref, { order: currentTests[toIndex].order });
+                    batch.update(test2Ref, { order: currentTests[idx].order });
+                    await batch.commit();
+                    navigateTo('editSeries', { seriesId });
+                }
+            }
+            if (target.closest('.manage-questions-btn')) navigateTo('manageQuestions', { seriesId: target.closest('.manage-questions-btn').dataset.seriesId, testId: target.closest('.manage-questions-btn').dataset.testId });
+            if (target.closest('#import-from-text-btn')) showImportFromTextModal(target.closest('#import-from-text-btn').dataset.seriesId, target.closest('#import-from-text-btn').dataset.testId);
+            if (target.closest('#add-manual-question-btn')) showQuestionFormModal(target.closest('#add-manual-question-btn').dataset.seriesId, target.closest('#add-manual-question-btn').dataset.testId, null, parseInt(target.closest('#add-manual-question-btn').dataset.count));
+            if (target.closest('.edit-question-btn')) {
+                const { seriesId, testId, questionId } = target.closest('.edit-question-btn').dataset;
+                const questionRef = doc(db, "testSeries", seriesId, "tests", testId, "questions", questionId);
+                const questionSnap = await getDoc(questionRef);
+                if (questionSnap.exists()) {
+                    showQuestionFormModal(seriesId, testId, { id: questionId, ...questionSnap.data() });
+                }
+            }
+            if (target.closest('.delete-question-btn')) {
+                const { seriesId, testId, questionId } = target.closest('.delete-question-btn').dataset;
+                showConfirmation("Delete this question?", async () => {
+                    await deleteDoc(doc(db, "testSeries", seriesId, "tests", testId, "questions", questionId));
+                    navigateTo('manageQuestions', { seriesId, testId });
+                });
+            }
+            if (target.matches('#translate-to-hindi-btn')) {
+                const button = target;
+                button.disabled = true; button.textContent = 'Translating...';
+                const form = button.closest('form');
+                const englishContent = {
+                    text: form.querySelector('#q-en-text').value,
+                    options: [form.querySelector('#q-en-opt1').value, form.querySelector('#q-en-opt2').value, form.querySelector('#q-en-opt3').value, form.querySelector('#q-en-opt4').value],
+                    explanation: form.querySelector('#q-en-exp').value
+                };
+                if (!englishContent.text || englishContent.options.some(o => !o)) {
+                    alert("Please fill in all required English fields before translating.");
+                    button.disabled = false; button.textContent = '✨ Auto-translate'; return;
+                }
+                const translated = await callGeminiForTranslation(englishContent);
+                if (translated) {
+                    form.querySelector('#q-hi-text').value = translated.text || '';
+                    if (translated.options && translated.options.length === 4) {
+                        form.querySelector('#q-hi-opt1').value = translated.options[0] || '';
+                        form.querySelector('#q-hi-opt2').value = translated.options[1] || '';
+                        form.querySelector('#q-hi-opt3').value = translated.options[2] || '';
+                        form.querySelector('#q-hi-opt4').value = translated.options[3] || '';
+                    }
+                    form.querySelector('#q-hi-exp').value = translated.explanation || '';
+                }
+                button.disabled = false; button.textContent = '✨ Auto-translate';
+            }
+            if (target.matches('#translate-bulk-btn')) {
+                const button = target;
+                button.disabled = true; button.textContent = 'Translating...';
+                const textarea = document.getElementById('text-import-area');
+                const englishText = textarea.value;
+                const translatedBlocks = await callGeminiForTranslation(englishText, true);
+                if (translatedBlocks) {
+                    const englishBlocks = englishText.split('---');
+                    const hindiBlocks = translatedBlocks.split('---');
+                    const mergedText = englishBlocks.map((engBlock, i) => (engBlock.trim() + '\n' + (hindiBlocks[i] || '').trim()).trim()).join('\n---\n');
+                    textarea.value = mergedText;
+                }
+                button.disabled = false; button.textContent = '✨ Auto-translate English to Hindi';
+            }
+        });
+
+        document.addEventListener('submit', async e => {
+            e.preventDefault();
+            if (e.target.matches('#add-test-form')) {
+                const form = e.target;
+                const seriesId = form.dataset.seriesId;
+                const newTestRef = doc(collection(db, "testSeries", seriesId, "tests"));
+                const newTest = {
+                    id: newTestRef.id, name: form.querySelector('#test-name').value,
+                    isDemo: form.querySelector('#is-demo').checked,
+                    questionCount: parseInt(form.querySelector('#test-questions').value),
+                    timeLimit: parseInt(form.querySelector('#test-time').value),
+                    order: Date.now()
+                };
+                await setDoc(newTestRef, newTest);
+                navigateTo('editSeries', { seriesId });
+                closeModal();
+            }
+            if (e.target.matches('#import-text-form')) {
+                const form = e.target;
+                const { seriesId, testId } = form.dataset;
+                const text = form.querySelector('#text-import-area').value;
+                const questionBlocks = text.split('---').filter(b => b.trim() !== '');
+                const batch = writeBatch(db);
+                questionBlocks.forEach(block => {
+                    const lines = block.trim().split('\n');
+                    const data = { en: { options: [] }, hi: { options: [] } };
+                    let qNo = null;
+                    lines.forEach(line => {
+                        const [key, ...valueParts] = line.split(':');
+                        const value = valueParts.join(':').trim();
+                        if (!key || !value) return;
+                        const cleanKey = key.trim().toUpperCase();
+                        if (cleanKey === 'Q') qNo = parseInt(value, 10);
+                        else if (cleanKey === 'QUESTION_EN') data.en.text = value;
+                        else if (cleanKey === 'QUESTION_HI') data.hi.text = value;
+                        else if (cleanKey === 'OPTION_EN') data.en.options.push(value.replace(/^[A-D]\)\s*/, ''));
+                        else if (cleanKey === 'OPTION_HI') data.hi.options.push(value.replace(/^[A-D]\)\s*/, ''));
+                        else if (cleanKey === 'EXPLANATION_EN') data.en.explanation = value;
+                        else if (cleanKey === 'EXPLANATION_HI') data.hi.explanation = value;
+                        else if (cleanKey === 'ANSWER') data.correctAnswer = ['A', 'B', 'C', 'D'].indexOf(value.trim().toUpperCase());
+                    });
+                    if (qNo && data.en.text && data.en.options.length > 1 && data.correctAnswer > -1) {
+                        data.q_no = qNo;
+                        batch.set(doc(collection(db, "testSeries", seriesId, "tests", testId, "questions")), data);
+                    }
+                });
+                await batch.commit();
+                closeModal();
+                showToast(`${questionBlocks.length} questions imported successfully!`);
+                navigateTo('manageQuestions', { seriesId, testId });
+            }
+            const questionFormHandler = async (form, isEditing) => {
+                const { seriesId, testId } = form.dataset;
+                const questionData = {
+                    q_no: parseInt(form.querySelector('#q-no').value),
+                    en: { text: form.querySelector('#q-en-text').value, options: [form.querySelector('#q-en-opt1').value, form.querySelector('#q-en-opt2').value, form.querySelector('#q-en-opt3').value, form.querySelector('#q-en-opt4').value], explanation: form.querySelector('#q-en-exp').value },
+                    correctAnswer: parseInt(form.querySelector('#correct-answer').value), type: 'mcq'
+                };
+                const hiText = form.querySelector('#q-hi-text').value;
+                if (hiText) {
+                    questionData.hi = { text: hiText, options: [form.querySelector('#q-hi-opt1').value, form.querySelector('#q-hi-opt2').value, form.querySelector('#q-hi-opt3').value, form.querySelector('#q-hi-opt4').value], explanation: form.querySelector('#q-hi-exp').value }
+                }
+                if (isEditing) {
+                    await updateDoc(doc(db, "testSeries", seriesId, "tests", testId, "questions", form.dataset.questionId), questionData);
+                    showToast('Question updated successfully!');
+                } else {
+                    await addDoc(collection(db, "testSeries", seriesId, "tests", testId, "questions"), questionData);
+                    showToast('Question added successfully!');
+                }
+                closeModal();
+                navigateTo('manageQuestions', { seriesId, testId });
+            };
+            if (e.target.matches('#add-manual-question-form')) await questionFormHandler(e.target, false);
+            if (e.target.matches('#edit-manual-question-form')) await questionFormHandler(e.target, true);
+             if (e.target.matches('#series-settings-form')) {
+                const form = e.target;
+                const seriesId = form.dataset.seriesId;
+                const updatedData = {
+                    name: form.querySelector('#series-name').value,
+                    price: parseInt(form.querySelector('#series-price').value),
+                    imageUrl: form.querySelector('#series-image-url').value,
+                    markingScheme: form.querySelector('#series-marking-scheme').value,
+                };
+                await updateDoc(doc(db, "testSeries", seriesId), updatedData);
+                showToast('Exam settings saved!');
+            }
+        });
+        
+        navigateTo('admin');
+    </script>
+</body>
+</html>
+
